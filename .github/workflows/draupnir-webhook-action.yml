@@ -20,19 +20,23 @@
 # handle + secretId come from GET …/repo/status (stored on the repository row).
 #
 # ROUTES USED
-#   GET  …/github/webhook-action/repo/status   — is this an e2e pending repo?
+#   GET  …/github/webhook-action/repo/status   — is this an e2e repo?
 #   POST …/github/webhook-action/repo          — default-branch encrypted tree
 #   POST …/github/webhook-action/pull-request  — PR changed-file encrypted tree
-#   POST …/github/webhook-action/comment       — comment/review event JSON only
+#   POST …/v1/repository/pull-requests/:id/comments — PR conversation / review
+#   POST …/v1/repository/pull-requests/:id/inline-comments — inline comment (path/line; code stays in snapshot)
 #   POST …/v1/tkai                             — machine reveal forwarder
 #                                                → GET TKAI /machine/secrets/:id/reveal
 #
 # HIGH-LEVEL FLOW
-#   1. Checkout PR head (when needed for file content)
+#   1. Checkout PR head or push SHA (when needed for file content)
 #   2. Validate secrets + write URLs
 #   3. GET repo/status — skip if not e2e
-#   4. If pending (or PR merged into default) → encrypt default tree → POST /repo
-#   5. If comment/review event → POST /comment (no file crypto)
+#   4. If push branch == status.defaultBranch, or PR closed+merged into that
+#      branch → encrypt default tree → POST /repo. Other pushes: reject (no /repo).
+#   5. If issue_comment or pull_request_review → POST /v1/repository/pull-requests/:id/comments
+#      If pull_request_review_comment → POST /v1/repository/pull-requests/:id/inline-comments
+#      (do not send plaintext source; snapshot already holds encrypted files)
 #   6. If pull_request → encrypt changed files → POST /pull-request
 #   7. Wipe private key / REK from the runner disk
 # =============================================================================
@@ -41,13 +45,17 @@ name: Draupnir webhook-action
 
 # -----------------------------------------------------------------------------
 # TRIGGERS
-# Fire on PR code events, PR conversation events, and manual dispatch.
+# Fire on push, PR code events, PR conversation events, and manual dispatch.
+# Push vs Draupnir defaultBranch is decided after GET repo/status (not job `if`).
 # -----------------------------------------------------------------------------
 on:
-  # PR lifecycle — may upload default tree and/or PR changed files
+  # Direct commits — /repo only when the pushed branch equals status.defaultBranch
+  push:
+  # PR lifecycle — changed files on open/sync; default tree only if merged into default
   pull_request:
     types: [opened, reopened, synchronize, closed, edited]
-  # Issue comments that belong to a PR (filtered in job `if` below)
+  # PR conversation comments. GitHub runs this from the *default branch* workflow
+  # (Actions tab, not the PR Checks panel). File must exist on the default branch.
   issue_comment:
     types: [created, edited, deleted]
   # Review submission / edit / dismiss → comment route (metadata only)
@@ -68,15 +76,14 @@ concurrency:
 permissions:
   contents: read
   pull-requests: read
+  issues: read
 
 jobs:
   forward:
     name: Forward to Draupnir
     runs-on: ubuntu-latest
-    # Skip plain issue comments (issues that are not pull requests)
-    if: >-
-      github.event_name != 'issue_comment'
-      || github.event.issue.pull_request != null
+    # Skip: plain issue comments (not on a PR). Do not compare to GitHub default_branch.
+    if: github.event_name != 'issue_comment' || github.event.issue.pull_request != null
     steps:
       # -----------------------------------------------------------------------
       # STEP 1 — Checkout
@@ -84,19 +91,19 @@ jobs:
       #   - list the default-branch tree (`git ls-tree`)
       #   - diff base…head for PR changed files
       #   - `git show` file contents at a specific SHA
-      # Skip checkout for events that only forward JSON (none today that need
-      # files without PR context); keep it for PR / review / PR-comment paths.
+      # Keep checkout for push, PR, review, and PR-comment paths.
       # -----------------------------------------------------------------------
       - name: Checkout
         if: >-
-          github.event_name == 'pull_request'
+          github.event_name == 'push'
+          || github.event_name == 'pull_request'
           || github.event_name == 'pull_request_review'
           || github.event_name == 'pull_request_review_comment'
           || (github.event_name == 'issue_comment' && github.event.issue.pull_request != null)
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          # Prefer PR head SHA so file reads match the PR tip
+          # Prefer PR head SHA so file reads match the PR tip; else push SHA
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       # -----------------------------------------------------------------------
@@ -118,7 +125,8 @@ jobs:
           PR_ACTION: ${{ github.event.action || '' }}
           PR_MERGED: ${{ github.event.pull_request.merged || false }}
           PR_BASE_REF: ${{ github.event.pull_request.base.ref || '' }}
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch || '' }}
+          # Branch that received the commit (push only). Compared to status.defaultBranch.
+          PUSH_BRANCH: ${{ github.ref_name }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
@@ -141,7 +149,7 @@ jobs:
           export STATUS_URL="${DRAUPNIR_BASE_URL}/github/webhook-action/repo/status"
           export REPO_URL="${DRAUPNIR_BASE_URL}/github/webhook-action/repo"
           export PR_URL="${DRAUPNIR_BASE_URL}/github/webhook-action/pull-request"
-          export COMMENT_URL="${DRAUPNIR_BASE_URL}/github/webhook-action/comment"
+          export REST_BASE_URL="${DRAUPNIR_BASE_URL}/v1/repository"
 
           # -------------------------------------------------------------------
           # STEP 2c — GitHub always writes the event JSON to GITHUB_EVENT_PATH
@@ -191,14 +199,14 @@ jobs:
           const statusUrl = process.env.STATUS_URL;
           const repoUrl = process.env.REPO_URL;
           const prUrl = process.env.PR_URL;
-          const commentUrl = process.env.COMMENT_URL;
+          const restBaseUrl = process.env.REST_BASE_URL;
           const headSha = process.env.PR_HEAD_SHA || '';
           const baseSha = process.env.PR_BASE_SHA || '';
           const prNumber = process.env.PR_NUMBER || '';
           const prAction = process.env.PR_ACTION || '';
           const prMerged = process.env.PR_MERGED === 'true';
           const prBaseRef = process.env.PR_BASE_REF || '';
-          let defaultBranch = process.env.DEFAULT_BRANCH || '';
+          const pushBranch = process.env.PUSH_BRANCH || '';
           const ghToken = process.env.GH_TOKEN || '';
 
           // Native GitHub webhook payload — forwarded to Draupnir as-is when needed
@@ -378,6 +386,25 @@ jobs:
           }
 
           // -----------------------------------------------------------------
+          // HELPER — postOrgJson(url, orgId, body)
+          // Versioned REST (comments / inline-comments). Needs x-organization-id.
+          // -----------------------------------------------------------------
+          function postOrgJson(url, orgId, body) {
+            const { code, text } = curlJson(
+              'POST',
+              url,
+              {
+                Authorization: `Bearer ${apiKey}`,
+                'x-organization-id': orgId,
+              },
+              body,
+            );
+            console.log(`POST ${url} → HTTP ${code}`);
+            console.log(text);
+            if (code < 200 || code >= 300) throw new Error(`Draupnir HTTP ${code}`);
+          }
+
+          // -----------------------------------------------------------------
           // HELPER — multipartUpload(url, deliveryId, rek, parts)
           // WHY multipart: large trees exceed a single request body (25mb limit).
           // Protocol:
@@ -412,11 +439,10 @@ jobs:
 
           // =================================================================
           // STEP 4 — GET /github/webhook-action/repo/status
-          // Ask Draupnir whether this repo is registered as e2e and whether a
-          // default-branch snapshot is still needed (isPending).
+          // Ask Draupnir whether this repo is registered as e2e.
           // If the row does not exist or isE2E=false → exit (wrong class of repo).
           // =================================================================
-          const statusQs = `fullName=${encodeURIComponent(repository)}`;
+          const statusQs = `fullName=${encodeURIComponent(repository)}${prNumber ? `&prNumber=${encodeURIComponent(prNumber)}` : ''}`;
           const status = curlJson('GET', `${statusUrl}?${statusQs}`, { Authorization: `Bearer ${apiKey}` });
           if (status.code < 200 || status.code >= 300) {
             throw new Error(`repo/status HTTP ${status.code}: ${status.text}`);
@@ -434,22 +460,39 @@ jobs:
           if (!saSecretId) {
             throw new Error('status.secretId missing — E2E repos require a TKAI secret id');
           }
-          // Prefer Draupnir's stored default branch if the event omitted it
-          if (!defaultBranch && status.json.defaultBranch) {
-            defaultBranch = status.json.defaultBranch;
-          }
-          if (!defaultBranch) defaultBranch = 'main';
+          const orgId = status.json.organizationId || '';
+          const authorId = status.json.createdByUserId || '';
+          const pullRequestId = status.json.pullRequestId || '';
+          const snapshotId = status.json.snapshotId || '';
+
+          const defaultBranch = status.json.defaultBranch || '';
 
           // =================================================================
           // STEP 5 — Decide whether to upload the default-branch tree
           // needDefault when:
-          //   - isPending=true (first bootstrap after FE import), OR
-          //   - PR closed + merged into the default branch (refresh snapshot)
+          //   - push to a branch that equals status.defaultBranch, OR
+          //   - PR closed + merged into status.defaultBranch
+          // PR opened / synchronize / reopened / edited never upload /repo.
+          // Push to any other branch: reject (no /repo).
           // =================================================================
-          let needDefault = status.json.isPending === true;
-          if (eventName === 'pull_request' && prAction === 'closed' && prMerged && prBaseRef === defaultBranch) {
-            needDefault = true;
+          if (eventName === 'push') {
+            if (!defaultBranch) {
+              throw new Error('status.defaultBranch missing — cannot decide whether this push is the default branch');
+            }
+            if (pushBranch !== defaultBranch) {
+              console.log(
+                `Rejected: push to '${pushBranch}' != Draupnir defaultBranch '${defaultBranch}'`,
+              );
+              process.exit(0);
+            }
           }
+          const mergedIntoDefault =
+            eventName === 'pull_request' &&
+            prAction === 'closed' &&
+            prMerged &&
+            !!defaultBranch &&
+            prBaseRef === defaultBranch;
+          const needDefault = eventName === 'push' || mergedIntoDefault;
 
           // List every file path on origin/<defaultBranch>
           function listDefaultFiles() {
@@ -496,17 +539,64 @@ jobs:
           }
 
           // =================================================================
-          // STEP 7 — Comment / review events → POST …/comment
-          // No encryption: Draupnir upserts from the GitHub event JSON only.
-          // Exit early so we do not also upload a PR file tree on these events.
+          // STEP 7 — Conversation vs inline comments (existing REST APIs)
+          //   issue_comment / pull_request_review
+          //     → POST /v1/repository/pull-requests/:id/comments
+          //   pull_request_review_comment
+          //     → POST /v1/repository/pull-requests/:id/inline-comments
+          // Source hunks are not sent (files already encrypted on the PR snapshot).
+          // Only `created` / `submitted`; edited/deleted skipped (no Draupnir comment id).
           // =================================================================
-          const isComment =
-            eventName === 'issue_comment' ||
-            eventName === 'pull_request_review' ||
-            eventName === 'pull_request_review_comment';
+          function requirePrCommentContext() {
+            if (!orgId) throw new Error('status.organizationId missing');
+            if (!authorId) throw new Error('API key has no createdByUserId — required as comments authorId');
+            if (!pullRequestId) {
+              console.log('No Draupnir pullRequestId for this GitHub PR number — skip comment sync');
+              process.exit(0);
+            }
+          }
 
-          if (isComment) {
-            postWebhook(commentUrl, `${deliveryBase}-comment`, event);
+          if (eventName === 'issue_comment' || eventName === 'pull_request_review') {
+            if (prAction && prAction !== 'created' && prAction !== 'submitted') {
+              console.log(`Skip ${eventName} action=${prAction}`);
+              process.exit(0);
+            }
+            requirePrCommentContext();
+            const body =
+              eventName === 'issue_comment'
+                ? (event.comment && event.comment.body) || ''
+                : (event.review && event.review.body) || '';
+            postOrgJson(`${restBaseUrl}/pull-requests/${pullRequestId}/comments`, orgId, {
+              authorId,
+              body: String(body),
+            });
+            process.exit(0);
+          }
+
+          if (eventName === 'pull_request_review_comment') {
+            if (prAction && prAction !== 'created') {
+              console.log(`Skip ${eventName} action=${prAction}`);
+              process.exit(0);
+            }
+            requirePrCommentContext();
+            if (!snapshotId) {
+              console.log('No PR snapshotId — skip inline comment (sync the PR files first)');
+              process.exit(0);
+            }
+            const comment = event.comment && typeof event.comment === 'object' ? event.comment : {};
+            const line =
+              typeof comment.line === 'number'
+                ? comment.line
+                : typeof comment.original_line === 'number'
+                  ? comment.original_line
+                  : undefined;
+            postOrgJson(`${restBaseUrl}/pull-requests/${pullRequestId}/inline-comments`, orgId, {
+              authorId,
+              snapshotId,
+              path: typeof comment.path === 'string' && comment.path.trim() ? comment.path : '(unknown)',
+              line,
+              body: typeof comment.body === 'string' ? comment.body : '',
+            });
             process.exit(0);
           }
 
